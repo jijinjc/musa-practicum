@@ -1,0 +1,201 @@
+---
+title: "Data-Cleaning-DiD-TOD"
+author: "MUSA Project Team"
+date: "2025-04-30"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+---
+
+This code is used for cleaning the data. The data provided by the Mecklenburg County is rather messy, so this code attempts at standardizing the data. This code will NOT run any of the models.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("Your Workspace") # Set your workspace here
+```
+
+Load necessary libraries here.
+
+```{r libraries}
+library(sf)
+library(lubridate)
+library(dplyr)
+library(purrr)
+```
+
+Section for standardizing data when each year is under a folder of its own, and the folder's naming convention is consistent. You will need to fix your folder's names by hand (unfortunately), and if there are multiple year's worth of shapefile under one folder, this code will not be able to name them separately.
+
+```{r}
+# Set your target directory here (use forward slashes or double backslashes on Windows)
+target_directory <- "Data"  # Change this to your directory
+
+# Function to rename files in subdirectories to match parent folder name
+rename_files_to_folder <- function(root_dir) {
+  # Get list of all subdirectories
+  subdirs <- list.dirs(root_dir, recursive = FALSE)
+  
+  if (length(subdirs) == 0) {
+    message("No subdirectories found in: ", root_dir)
+    return(invisible())
+  }
+  
+  # Process each subdirectory
+  for (dir in subdirs) {
+    # Get all files in the directory (excluding subdirectories)
+    files <- list.files(dir, full.names = TRUE, recursive = FALSE, include.dirs = FALSE)
+    
+    if (length(files) == 0) {
+      next
+    }
+    
+    # Get the folder name (last part of the path)
+    folder_name <- basename(dir)
+    
+    # Process each file
+    for (file in files) {
+      # Get file extension
+      ext <- tools::file_ext(file)
+      
+      # Construct new filename
+      if (nchar(ext) > 0) {
+        new_name <- file.path(dir, paste0(folder_name, ".", ext))
+      } else {
+        new_name <- file.path(dir, folder_name)
+      }
+      
+      # Rename the file (only if names are different)
+      if (file != new_name) {
+        file.rename(file, new_name)
+      }
+    }
+  }
+}
+
+# Verify directory exists
+if (!dir.exists(target_directory)) {
+  stop("Directory does not exist: ", target_directory)
+}
+
+# Run the function
+rename_files_to_folder(target_directory)
+```
+
+After renaming the files, we will work on keeping and organizing information that we need. First, we set up a filter that will greatly decrease the amount of data we will be using for the model.
+
+```{r}
+# Create category of building description to filter
+resCatsSpec = c("RES", "RES CONDO", "TOWNHOUSE", "MFD HOME-DW", "MFD HOME-SW", "APT-HRISE >=7", "APT-GDN <=3", "APT-TOWNHSE", "RES CONDO-HI")
+```
+
+The following code is a for loop for loading the shapefiles, applying the filter, and transforming them into csvs assuming that your shapefiles are in separate folders organized by year, and you have ran the proper naming code above. This code will take a relatively LONG time, as the shapefiles each contain a lot of data.
+
+```{r}
+input_folder <- "Data"  # Base folder where year-specific folders are stored
+output_folder <- "Data/Taxdata_csvs"  # Folder where all CSVs will be saved
+station_file = "Data/LYNX_Blue_Line_Stations/LYNX_Blue_Line_Stations.shp" # Blue Line Station file
+
+stations <- st_read(station_file) %>%
+  filter(StationTyp == "Blue Line Extension Station") %>% # Filter for only extension stations
+  st_transform(crs = 2264) # Transform for buffer creations
+
+# Create half-mile buffer (2640 feet)
+station_buffer <- st_buffer(stations, dist = 2640) %>%
+  st_union()  # Combine all buffers into single polygon
+
+# Create output folder if it doesn't exist
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Process each year from 2004 to 2023
+walk(2004:2023, function(year) {
+  # Construct file paths
+  year_folder <- file.path(input_folder, paste0("Taxdata_", year))
+  shp_file <- file.path(year_folder, paste0("Taxdata_", year, ".shp"))
+  csv_file <- file.path(output_folder, paste0("Taxdata_", year, "_filtered.csv"))
+  
+  # Check if the shapefile exists
+  if (file.exists(shp_file)) {
+    tryCatch({
+      # Read and prepare tax data
+      tax_data <- st_read(shp_file, quiet = TRUE) %>%
+        # Convert all column names to lowercase
+        setNames(tolower(names(.))) %>%
+        # Transform to target CRS (EPSG 2264)
+        st_transform(crs = 2264) %>%
+        # Filter based on your criteria
+        filter(year(dateofsale) == year,
+               descbuildi %in% resCatsSpec,
+               sales_price > 1000)
+      
+      # 3. Add TOD classification ----
+      # Check if geometry intersects with station buffer
+      intersects_buffer <- st_intersects(tax_data, station_buffer, sparse = FALSE)[,1]
+      
+      # Add TOD column
+      tax_data <- tax_data %>%
+        mutate(TOD = ifelse(intersects_buffer, "treatment", "control")
+               treat = ifelse(intersects_buffer, 1, 0) %>%
+        # Drop geometry column before writing to CSV
+        st_drop_geometry()
+      
+      # 4. Write to CSV ----
+      write.csv(tax_data, csv_file, row.names = FALSE)
+      
+      message("Processed ", year, " successfully")
+    }, error = function(e) {
+      warning("Error processing ", year, ": ", e$message)
+    })
+  } else {
+    warning("File not found for year ", year, ": ", shp_file)
+  }
+})
+
+message("Processing complete. All CSV files saved to: ", normalizePath(output_folder))
+```
+Or if you want to individually run each shapefile, you can run this code below.
+
+```{r}
+output_folder <- "Data/Taxdata_csvs"  # Folder where all CSVs will be saved
+station_file = "Data/LYNX_Blue_Line_Stations/LYNX_Blue_Line_Stations.shp" # Blue Line Station file
+
+stations <- st_read(station_file) %>%
+  filter(StationTyp == "Blue Line Extension Station") %>% # Filter for only extension stations
+  st_transform(crs = 2264) # Transform for buffer creations
+
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Create half-mile buffer (2640 feet)
+station_buffer <- st_buffer(stations, dist = 2640) %>%
+  st_union()  # Combine all buffers into single polygon
+
+taxdata = st_read("Data/Taxdata_2018/Taxdata_2018.shp")%>% #This code runs the 2018 data. You can change the variable name and path to your needs
+  # Convert all column names to lowercase
+  setNames(tolower(names(.))) 
+
+taxdata = taxdata%>%
+  st_transform(crs = 2264) %>% # Transform to target CRS (EPSG 2264)
+  filter(year(dateofsale) == 2018, # Filter based on your criteria
+         descbuildi %in% resCatsSpec,
+         sales_price > 1000)
+
+# 3. Add TOD classification ----
+# Check if geometry intersects with station buffer
+intersects_buffer <- st_intersects(taxdata18, station_buffer, sparse = FALSE)[,1]
+
+taxdata <- taxdata %>%
+        mutate(TOD = ifelse(intersects_buffer, "treatment", "control"),
+               treat = ifelse(intersects_buffer, 1, 0)) %>%
+        # Drop geometry column before writing to CSV
+        st_drop_geometry()
+      
+      # 4. Write to CSV ----
+write.csv(taxdata, "Data/Taxdata_csvs/Taxdata_2018_filtered.csv", row.names = FALSE)
+```
+
+Upon using this code, you should have a relatively clean set of csvs, with standardized names. These csvs will have also been labelled accordingly based on their proximity to the extension stations. The csvs will also be cleaned once when running the model code.

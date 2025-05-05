@@ -1,0 +1,415 @@
+---
+title: "Charlotte DiD Analysis Reference Guide"
+author: "MUSA Project Team"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+  word_document: default
+---
+
+# Introduction
+
+This document serves as a companion to the **Charlotte DiD Full Analysis Rmd** file. It explains the methodologies, code, and decision-making processes used in the analysis. Use this guide alongside the analysis code to understand each step and the reasoning behind it.
+
+# Methodological Guide and Code Documentation for Charlotte Blue Line DiD Analysis
+
+## Purpose of This Document
+
+This document serves as a detailed methodological companion to the main analysis file (`Charlotte_DiD_Full_Analysis.Rmd`). Its purpose is to:
+
+1. Explain the rationale behind methodological choices
+2. Document code implementation details
+3. Provide theoretical background for analytical decisions
+4. Serve as a reference for future researchers
+
+## Code Structure Overview
+
+The analysis is organized into several key components:
+
+1. Data Preparation (`combine_taxdata.R`)
+2. Main Analysis (`Charlotte_DiD_Full_Analysis.Rmd`)
+3. Supporting Functions and Utilities
+
+### File Dependencies
+
+```
+project/
+├── combine_taxdata.R           # Data cleaning and preparation
+├── Charlotte_DiD_Full_Analysis.Rmd    # Main analysis
+└── data/
+    └── combined_taxdata_2004_2023_clean.csv
+```
+
+## Data Preparation Methodology
+
+### Data Cleaning Process
+[Cross-reference: Data Preparation section in Full Analysis]
+
+1. **Initial Data Loading**
+   ```r
+   combined_data <- fread("combined_taxdata_2004_2023_clean.csv")
+   ```
+   **Why:** Using `fread` for efficient loading of large datasets
+
+2. **Quality Checks**
+   ```r
+   check_unrealistic_values <- function(data) {
+     # Function implementation
+   }
+   ```
+   **Why:** Systematic approach to identify data quality issues
+   **Alternative Considered:** Manual inspection of outliers
+   **Decision Rationale:** Automated checks more reproducible
+
+3. **Value Filtering and Data Cleaning**
+   ```r
+   combined_data <- combined_data[fin_sqft >= 200 & fin_sqft <= 20000 & sales_price >= 1000 & sales_price <= 10000000 & year_built >= 1877 & agebuild >= 0 & bedrooms <= 20]
+   ```
+   **Why:** Remove unrealistic or erroneous values from the dataset
+   **Thresholds Chosen Based On:** Local market knowledge and data distribution
+
+#### Special Case: Handling of the Lot Size Variable
+
+- **Initial State:**
+  - The original dataset included a `lot_size` variable measured in acres.
+  - To make it comparable to other property characteristics, we converted `lot_size` from acres to square feet (1 acre = 43,560 sqft).
+
+- **Data Quality Issues:**
+  - After conversion, we found that 55.3% of all entries had a lot size of 0, which is not plausible for residential properties and likely reflects missing or erroneous data.
+  - The distribution of lot size was highly right-skewed, with a small number of extremely large values (outliers).
+
+- **Cleaning Steps:**
+  - We removed all properties with a lot size of 0.
+  - We trimmed outliers by excluding properties with extremely large lot sizes (using a reasonable upper cutoff based on the distribution and local knowledge).
+  - These steps reduced the total number of observations to just over 131,500 and greatly reduced the size of the treatment group after matching.
+
+- **Impact on Model Results:**
+  - Including lot size in the model led to unexpected results:
+    - The coefficient for lot size became negative, suggesting that larger lots were associated with lower sale prices, which is counterintuitive and likely reflects residual data quality issues or collinearity with other variables.
+    - The inclusion of lot size also changed the estimated relationships between other property characteristics and sale price, and altered the treatment effect estimates.
+  - The reduction in sample size and treatment group after matching also decreased statistical power and generalizability.
+
+- **Final Decision:**
+  - Given the high proportion of missing/erroneous values, the right-skewed distribution, and the destabilizing effect on model results, we decided to remove the lot size variable entirely from the analysis.
+  - This decision improved the reliability and interpretability of our results, and ensured that the treatment and control groups remained comparable on high-quality, consistently measured variables.
+
+**Summary:**
+The lot size variable was excluded from the final analysis due to pervasive data quality issues, its disproportionate impact on sample size and matching, and its destabilizing effect on model results. This step was necessary to maintain the integrity and validity of our causal inference.
+
+## Variable Construction Methodology
+
+### Outcome Variable
+[Cross-reference: Variable Construction section in Full Analysis]
+
+1. **Log Price Transformation**
+   ```r
+   combined_data[, lnsp := log(sales_price)]
+   ```
+   **Why:** 
+   - Normalize price distribution
+   - Allow for percentage interpretation of coefficients
+   - Standard practice in hedonic price models
+   
+   **Alternative Considered:** Raw prices
+   **Decision Rationale:** Log transformation better meets model assumptions
+
+### Treatment Variables
+[Cross-reference: Treatment Definition section in Full Analysis]
+
+1. **Binary Treatment Indicator**
+   ```r
+   combined_data[, treat := as.numeric(TOD)]
+   ```
+   **Why:**
+   - Clear treatment/control designation
+   - Based on 0.5-mile buffer
+   
+   **Alternative Considered:** Continuous treatment (distance)
+   **Decision Rationale:** Binary treatment clearer for DiD interpretation
+
+## Matching Methodology
+
+### Why Propensity Score Matching (PSM) is Necessary
+
+In observational studies like ours—where properties are not randomly assigned to be near or far from the Blue Line—there is a risk that the treatment and control groups differ systematically in ways that could bias our results. This is called **selection bias**.
+
+#### The Problem Without Matching
+- **Imbalance in Key Characteristics:**  
+  If we simply compare properties near the Blue Line (treatment group) to those farther away (control group) without matching, the groups may differ in important ways:
+    - The treatment group might have more 2-story, 3-bedroom, 3-bathroom homes.
+    - The control group might have smaller, older, or otherwise different homes.
+- **Confounding:**  
+  These differences in property characteristics (size, age, number of bedrooms/bathrooms, etc.) are **confounders**—they affect both the likelihood of being near the Blue Line and the sale price.
+- **Misattribution of Effects:**  
+  If the treatment group has larger or newer homes, and we observe higher sale prices, we cannot tell if the price difference is due to the Blue Line (the treatment) or simply due to these housing characteristics.
+
+#### How PSM Solves This
+- **Balancing Covariates:**  
+  PSM creates a matched sample where the treatment and control groups are similar in observed characteristics (e.g., square footage, bedrooms, age, bathrooms, year).
+- **Simulating Randomization:**  
+  By matching on the propensity score (the probability of being in the treatment group given observed characteristics), we simulate the conditions of a randomized experiment, reducing selection bias.
+- **Isolating the Treatment Effect:**  
+  After matching, any remaining difference in sale price between the groups is more likely to be attributable to the Blue Line, not to differences in property characteristics.
+
+#### Example
+Suppose:
+- **Without Matching:**  
+  - Treatment group: Mostly large, new homes (naturally higher prices)
+  - Control group: Mostly small, old homes (naturally lower prices)
+  - Result: We might falsely conclude the Blue Line increased prices, when in fact it's just the types of homes.
+- **With Matching:**  
+  - Both groups: Similar mix of home sizes, ages, and features
+  - Result: Any price difference is more plausibly due to the Blue Line.
+
+#### Why Not Just Control in Regression?
+- **Regression Adjustment Alone:**  
+  While regression can adjust for differences, it relies on correct model specification and can be sensitive to outliers or lack of overlap.
+- **Matching + Regression:**  
+  Matching first ensures comparability, and regression then adjusts for any remaining small differences, providing a more robust estimate.
+
+#### Summary
+> **Propensity Score Matching is essential to ensure that our comparison of property values near and far from the Blue Line is fair and unbiased. Without it, we risk attributing differences in sale price to the transit intervention when they may simply reflect differences in the types of homes being sold.**
+
+### Propensity Score Matching
+[Cross-reference: Matching Process section in Full Analysis]
+
+1. **Variable Selection**
+   ```r
+   match.out <- matchit(treat ~ fin_sqft + bedrooms + agebuild + bath + year,
+                       data = combined_data,
+                       method = "optimal",
+                       ratio = 1)
+   ```
+   **Why each variable:**
+   - `fin_sqft`: Primary determinant of property value
+   - `bedrooms`: Captures property size/type
+   - `agebuild`: Controls for depreciation
+   - `bath`: Additional quality indicator
+   - `year`: Controls for time trends
+
+   **Alternatives Considered:**
+   - Nearest neighbor matching
+   - Coarsened exact matching
+   
+   **Decision Rationale:** Optimal matching provides better balance
+
+## Model Specification Details
+
+### Year Fixed Effects in DiD Analysis
+[Cross-reference: Model Specifications section in Full Analysis]
+
+1. **Theoretical Foundation**
+   ```r
+   matched_data[, year_factor := factor(year)]
+   matched_data[, year_factor := relevel(year_factor, ref = "2017")]
+   ```
+   **Why Year Fixed Effects are Crucial:**
+   - **Parallel Trends Assumption:** DiD relies on the assumption that, in the absence of treatment, the treatment and control groups would have followed parallel trends. Year fixed effects help control for any year-specific shocks that might affect both groups differently.
+   
+   - **Market Dynamics:** The Charlotte housing market experienced significant changes during our study period (2004-2023), including:
+     - The 2008 financial crisis
+     - Post-crisis recovery
+     - Local economic growth
+     - General market appreciation
+     - COVID-19 pandemic
+   
+   - **Causal Inference:** By including year fixed effects, we can:
+     - Control for time-varying confounders
+     - Isolate the pure treatment effect from general market trends
+     - Test for pre-treatment differences (parallel trends)
+     - Validate that any effect is truly due to the Blue Line intervention
+
+2. **Implementation Details**
+   ```r
+   did_model_2018_fe <- lm(lnsp ~ treat + year_factor + 
+                          treat*post_2018 +
+                          fin_sqft + bedrooms + agebuild + bath,
+                          data = matched_data)
+   ```
+   **Why Factor(year) Instead of Continuous Year:**
+   - **Flexibility:** Factor(year) allows for non-linear time trends
+   - **Precision:** Captures year-specific shocks that might not follow a linear pattern
+   - **Diagnostics:** Makes it easier to test for pre-treatment differences
+   - **Interpretation:** Each year's coefficient represents the deviation from the base year (2017)
+
+3. **Validation of Causal Relationship**
+   ```r
+   # Pre-treatment period indicator
+   matched_data[, pre_treatment := ifelse(year < 2011, 1, 0)]
+   
+   # Interaction terms for each pre-treatment year
+   for (yr in 2004:2010) {
+     matched_data[, paste0("treat_", yr) := treat * (year == yr)]
+   }
+   ```
+   **Why This Matters:**
+   - **Pre-Treatment Trends:** By examining coefficients for pre-treatment years, we can:
+     - Test if treatment and control groups were on parallel trends
+     - Identify any pre-existing differences
+     - Validate that the treatment effect is not due to pre-existing trends
+   
+   - **Causal Validation:** The year fixed effects help us:
+     - Control for general market appreciation
+     - Account for local economic conditions
+     - Isolate the Blue Line's specific impact
+     - Ensure the effect is not due to other time-varying factors
+
+4. **Alternative Approaches Considered**
+   - **Linear Time Trend:**
+     ```r
+     # Alternative specification (not used)
+     did_model_linear <- lm(lnsp ~ treat + year + 
+                           treat*post_2018 +
+                           fin_sqft + bedrooms + agebuild + bath,
+                           data = matched_data)
+     ```
+     **Why Not Used:** Too restrictive, assumes linear time trends
+   
+   - **Year Dummies:**
+     ```r
+     # Current preferred specification
+     did_model_fe <- lm(lnsp ~ treat + factor(year) + 
+                       treat*post_2018 +
+                       fin_sqft + bedrooms + agebuild + bath,
+                       data = matched_data)
+     ```
+     **Why Preferred:** More flexible, better controls for time-varying confounders
+
+5. **Interpretation of Year Effects**
+   ```r
+   # Example of year effect interpretation
+   year_effects <- coef(did_model_2018_fe)[grep("year_factor", names(coef(did_model_2018_fe)))]
+   ```
+   **What These Tell Us:**
+   - **Market Conditions:** Each year's coefficient shows how property values in that year differed from the base year (2017)
+   - **Treatment Effect:** The interaction term `treat*post_2018` shows the effect beyond these year-specific changes
+   - **Parallel Trends:** Similar year effects for treatment and control groups pre-2018 support the parallel trends assumption
+
+6. **Robustness Checks**
+   ```r
+   # Model without year fixed effects (for comparison)
+   did_model_no_fe <- lm(lnsp ~ treat + 
+                        treat*post_2018 +
+                        fin_sqft + bedrooms + agebuild + bath,
+                        data = matched_data)
+   ```
+   **Why We Compare:**
+   - Shows how much of the effect is due to general market trends
+   - Helps validate that our results are not driven by time trends
+   - Provides bounds on the true treatment effect
+
+### Base DiD Model
+[Cross-reference: Model Specifications section in Full Analysis]
+
+1. **Model Formula**
+   ```r
+   did_model_2018_fe <- lm(lnsp ~ treat + year_factor + 
+                          treat*post_2018 +
+                          fin_sqft + bedrooms + agebuild + bath,
+                          data = matched_data)
+   ```
+   **Components Explained:**
+   - `treat`: Binary treatment indicator
+   - `year_factor`: Year fixed effects
+   - `treat*post_2018`: DiD interaction
+   - Control variables: Property characteristics
+
+   **Alternative Specifications Considered:**
+   - Random effects
+   - Panel models
+   
+   **Decision Rationale:** Fixed effects control for year-specific shocks
+
+## Diagnostic Tests Implementation
+
+### Parallel Trends Test
+[Cross-reference: Parallel Trends section in Full Analysis]
+
+1. **Test Implementation**
+   ```r
+   # Pre-treatment interactions
+   for (yr in 2004:2010) {
+     matched_data[, paste0("treat_", yr) := treat * (year == yr)]
+   }
+   ```
+   **Why:** Test key DiD assumption
+   **Implementation Choice:** Year-by-year interactions
+   **Alternative Considered:** Continuous time interaction
+
+### Placebo Tests
+[Cross-reference: Placebo Tests section in Full Analysis]
+
+1. **Test Design**
+   ```r
+   run_placebo_test <- function(placebo_year) {
+     # Function implementation
+   }
+   ```
+   **Why:** Validate treatment effect
+   **Design Choice:** Year-by-year placebos
+   **Alternative Considered:** Random assignment placebos
+
+## Visualization Methodology
+
+### Time Series Plots
+[Cross-reference: Results Visualization section in Full Analysis]
+
+1. **Mean Price Trends**
+   ```r
+   ggplot(time_series_data, aes(x = year, y = mean_lnsp, 
+          group = treat, color = factor(treat))) +
+     geom_line()
+   ```
+   **Why:** Visual inspection of trends
+   **Design Choices:**
+   - Line plot for temporal trends
+   - Color coding for treatment/control
+   - Confidence intervals for uncertainty
+
+## Results Interpretation Guide
+
+### Effect Size Calculation
+[Cross-reference: Results section in Full Analysis]
+
+1. **Percentage Effect**
+   ```r
+   effect_pct <- (exp(coef) - 1) * 100
+   ```
+   **Why:** Convert log coefficients to percentages
+   **Interpretation Notes:**
+   - Small coefficients ≈ percentage change
+   - Large coefficients need exact calculation
+
+## Limitations and Extensions
+
+### Current Limitations
+[Cross-reference: Limitations section in Full Analysis]
+
+1. **Spatial Correlation**
+   - Not currently addressed
+   - Could affect standard errors
+   - Future: Consider spatial regression
+
+2. **Temporal Dynamics**
+   - Basic lag structure
+   - Could explore more complex dynamics
+   - Future: Consider distributed lag models
+
+
+# Variable Construction
+
+## Derived Variables
+
+We create several derived variables to facilitate our analysis:
+
+### Log Price Variable
+
+We calculate the log of the sales price to reduce skewness and make the distribution more normal:
+
+```r
+combined_data[, lnsp := log(sales_price)]
+```

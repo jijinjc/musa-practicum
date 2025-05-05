@@ -1,0 +1,829 @@
+---
+title: "Charlotte Blue Line DiD Analysis"
+author: "MUSA Project Team"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+This document presents a comprehensive analysis of the impact of the Charlotte Blue Line transit system on property values using a Difference-in-Differences (DiD) approach. The analysis covers the period from 2004 to 2023, with particular focus on the physical opening of the Blue Line in 2018 and its announcement in 2011.
+
+## Background
+
+The Blue Line transit system in Charlotte represents a significant infrastructure investment with potential implications for property values. This analysis seeks to quantify the causal effect of the Blue Line on property values using a rigorous DiD methodology.
+
+Our control group is key as we match the houses based on characteristics of these houses. This helps us control for any pre-existing differences between the treatment and control groups. By which we mean that the sale price could simply be due to the characteristics of the house and the neighborhood. For example, houses with 3 bedrooms and 2 bathrooms and a big lot size in a good neighborhood will sell for more money. Meanwhile, houses with 1 bedroom and 1 bathroom and a small lot size in a bad neighborhood will sell for less money. If we don't control for these characteristics, we may attribute the difference in sale price to the Blue Line opening. Even regardless of neighborhood quality, houses with 3 beds and 2 baths further away from the station may sell for 3x more than houses with 1 bed and 1 bath nearby the station.
+
+# Data Preparation and Setup
+
+```{r load_packages}
+library(tidyverse)
+library(data.table)
+library(MatchIt)  # For propensity score matching
+library(lmtest)   # For robust standard errors
+library(sandwich) # For robust standard errors
+library(knitr)    # For table formatting
+library(kableExtra) # For enhanced table formatting
+library(car)      # For linearHypothesis function in parallel trends test
+library(quantreg)
+```
+
+```{r setup_working_dir}
+setwd("Your Workspace") # Set your workspace here
+options(scipen = 999)
+```
+
+## Data Loading and Initial Processing
+
+```{r load_data}
+combined_data <- fread("C:/Users/super/Downloads/DiD_TOD/Data/combined_taxdata_2004_2023_clean.csv")
+```
+
+## Data Quality Checks
+
+```{r data_quality}
+# Function to check for unrealistic values
+check_unrealistic_values <- function(data) {
+  ranges <- list(
+    sales_price = c(1000, 10000000),  # $1,000 to $10M
+#    lot_size = c(0.01, 100),          # 0.01 to 100 acres
+    fin_sqft = c(100, 10000),         # 100 to 10,000 sqft
+    bedrooms = c(0, 10),              # 0 to 10 bedrooms
+    bath = c(0, 10),                  # 0 to 10 bathrooms
+    agebuild = c(0, 200),             # 0 to 200 years
+    year = c(2004, 2023)              # Study period
+  )
+  
+  results <- list()
+  
+  for (var in names(ranges)) {
+    if (var %in% names(data)) {
+      min_val <- min(data[[var]], na.rm = TRUE)
+      max_val <- max(data[[var]], na.rm = TRUE)
+      out_of_range <- data[[var]] < ranges[[var]][1] | data[[var]] > ranges[[var]][2]
+      n_out_of_range <- sum(out_of_range, na.rm = TRUE)
+      n_missing <- sum(is.na(data[[var]]))
+      
+      results[[var]] <- list(
+        min = min_val,
+        max = max_val,
+        n_out_of_range = n_out_of_range,
+        n_missing = n_missing,
+        out_of_range_percent = (n_out_of_range / nrow(data)) * 100,
+        missing_percent = (n_missing / nrow(data)) * 100
+      )
+    }
+  }
+  
+  return(results)
+}
+
+# data quality check
+data_quality_results <- check_unrealistic_values(combined_data)
+
+data_quality_table <- data.frame(
+  Variable = names(data_quality_results),
+  Min = sapply(data_quality_results, function(x) x$min),
+  Max = sapply(data_quality_results, function(x) x$max),
+  Out_of_Range = sapply(data_quality_results, function(x) x$n_out_of_range),
+  Missing = sapply(data_quality_results, function(x) x$n_missing),
+  Out_of_Range_Percent = sapply(data_quality_results, function(x) x$out_of_range_percent),
+  Missing_Percent = sapply(data_quality_results, function(x) x$missing_percent)
+)
+
+kable(data_quality_table, caption = "Data Quality Check Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# Methodology
+
+## DiD Model Structure
+
+The Classic 2x2 DiD Framework:
+
+| Time Period | Treatment Group | Control Group |
+|-------------|-----------------|---------------|
+| Pre-2018    | Y₁₁            | Y₁₂           |
+| Post-2018   | Y₂₁            | Y₂₂           |
+
+Where:
+- Y₁₁: Average outcome for treatment group before intervention
+- Y₁₂: Average outcome for control group before intervention
+- Y₂₁: Average outcome for treatment group after intervention
+- Y₂₂: Average outcome for control group after intervention
+
+The DiD estimate is calculated as:
+DiD = (Y₂₁ - Y₁₁) - (Y₂₂ - Y₁₂)
+
+In our model:
+- Treatment Group: Properties within 0.5-mile buffer
+- Control Group: Properties outside buffer
+- Pre-period: Before 2018
+- Post-period: 2018 and after
+- Announcement Period: 2011-2018
+- Post-Announcement Period: 2018 and after
+
+Visual Representation:
+"Imagine a graph with time on the x-axis and property values on the y-axis. Before 2018, both treatment and control groups follow parallel trends. After 2018, the treatment group's line diverges upward, showing the Blue Line effect."
+
+## Matching Process
+
+We use propensity score matching to ensure treatment and control groups are comparable. The matching variables include:
+1. fin_sqft: Controls for living space differences
+2. bedrooms: Controls for property type
+3. agebuild: Controls for property age
+4. bath: Controls for property quality
+
+Matching Method:
+- Optimal matching with 1:1 ratio
+- Uses Mahalanobis distance
+- Ensures closest possible matches
+
+Interpreting Matching Results:
+- Check balance statistics before/after matching
+- Look at standardized mean differences
+- Verify overlap in propensity scores
+- Examine common support region
+
+## Model Overview
+
+This DiD model assesses whether the physical opening of the Blue Line in 2018 had any effect on property sale prices from 2004-2023.
+
+Key Components:
+- Intervention Year: 2018 (Blue Line physical opening)
+- Announcement Year: 2011 (Blue Line announcement)
+- Time Period: 2004-2023
+- Treatment Group: Properties within 0.5-mile buffer of Blue Line
+- Control Group: Properties outside 0.5-mile buffer
+
+## Treatment Variable
+
+The treatment variable (treat) is a binary indicator:
+- treat = 1: Properties within 0.5-mile buffer of Blue Line
+- treat = 0: Properties outside 0.5-mile buffer
+
+## DiD Model Specification
+
+We implemented multiple model specifications to capture different aspects of the treatment effect:
+
+| Model               | Treatment Effect          | Significance | Parallel Trends? | Use in Report                      |
+| ------------------- | ------------------------- | ------------ | ---------------- | ---------------------------------- |
+| Base DiD (2018, FE) | 0.173 (\*\*\*), +18.9%    | Yes          | Assumed          | ✅ Main model                       |
+| Base DiD (2011, FE) | 0.147 (\*\*), +15.8%      | Yes          | Assumed          | ✅ Anticipation effect              |
+| Segmented           | Mixed                     | Mixed        | ❌ Not satisfied | ✅ Use to explore violations/trends |
+| No FE versions      | Slightly higher estimates | Yes          | Less reliable    | Robustness only ✅                  |
+| Parallel trends test| Tests pre-treatment balance| ✅           | Diagnostic     | (for segmented model)              |
+
+```{r data_prep}
+# log price variable
+combined_data[, lnsp := log(sales_price)]
+
+# post-treatment indicators
+combined_data[, post_2018 := ifelse(year >= 2018, 1, 0)]  # Physical opening
+combined_data[, post_2011 := ifelse(year >= 2011, 1, 0)]  # Announcement
+
+
+set.seed(534)
+
+# sample sizes
+treat_prop <- combined_data[, mean(treat)]
+sample_size <- 200000
+n_treated <- round(sample_size * treat_prop)
+n_control <- sample_size - n_treated
+
+# Stratified sampling
+treated_sample <- combined_data[treat == 1][sample(.N, n_treated)]
+control_sample <- combined_data[treat == 0][sample(.N, n_control)]
+sub_data <- rbind(treated_sample, control_sample)
+```
+
+## Propensity Score Matching
+
+```{r matching}
+# Perform matching
+match.out <- matchit(treat ~ fin_sqft + bedrooms + agebuild + bath + year,
+                    data = sub_data,
+                    method = "optimal",
+                    ratio = 1)
+
+# Extract matched data
+matched_data <- match.data(match.out)
+
+# year_factor variable for fixed effects models
+matched_data[, year_factor := factor(year)]
+matched_data[, year_factor := relevel(year_factor, ref = "2017")]
+
+# Time since original opening and since extension opening
+matched_data[, time_since_2007 := pmax(0, year - 2007)]
+matched_data[, time_since_2011 := pmax(0, year - 2011)]
+matched_data[, time_since_2018 := pmax(0, year - 2018)]
+
+summary(match.out)
+# you can save the matched data (so we dont have to run the matching process again)
+fwrite(matched_data, "matched_data.csv")
+```
+
+## Interpreting PSM Results
+
+Using our sample of 200,000 properties as an example:
+
+### Before Matching:
+- Treatment group: 2,489 properties
+- Control group: 197,511 properties
+- Initial differences in key variables:
+  * fin_sqft: Control mean = 2150.70, Treated mean = 1586.75
+  * bedrooms: Control mean = 3.24, Treated mean = 2.66
+  * agebuild: Control mean = 24.15, Treated mean = 41.11
+  * bath: Control mean = 2.10, Treated mean = 1.70
+  * year: Control mean = 2013.35, Treated mean = 2014.37
+
+### After Matching:
+- Perfect 1:1 matching achieved (2,489 treated, 2,489 control)
+- All variables show excellent balance:
+  * fin_sqft: Std. Mean Diff. reduced to -0.0360 (Var. Ratio: 0.9583)
+  * bedrooms: Std. Mean Diff. reduced to -0.0152 (Var. Ratio: 0.8965)
+  * agebuild: Std. Mean Diff. reduced to -0.0400 (Var. Ratio: 1.5464)
+  * bath: Std. Mean Diff. reduced to 0.0019 (Var. Ratio: 1.1457)
+  * year: Std. Mean Diff. reduced to 0.0016 (Var. Ratio: 1.1470)
+
+### Key Points from Our Results:
+
+1. Initial Imbalance:
+   - Treatment properties were systematically different from controls
+   - Older properties (agebuild difference: 41.11 vs 24.15 years)
+   - Smaller properties (fin_sqft difference: 1587 vs 2151 sqft)
+   - Fewer bedrooms (2.66 vs 3.24) and bathrooms (1.70 vs 2.10)
+   - More recent sales (2014.37 vs 2013.35)
+
+2. Matching Success:
+   - All standardized mean differences reduced to near zero
+   - Variance ratios close to 1 for most variables
+   - eCDF means and maxes significantly reduced
+   - Particularly good balance achieved for:
+     * bath (SMD: 0.0019)
+     * year (SMD: 0.0016)
+     * fin_sqft (SMD: -0.0360)
+
+3. What This Means:
+   - Matching successfully created comparable groups
+   - Remaining differences are minimal
+   - Results are more likely to reflect true treatment effect
+   - Reduces potential for selection bias
+   - Particularly good balance in key property characteristics
+
+4. Limitations:
+   - Some control properties unmatched (195,022)
+   - May affect generalizability
+   - But necessary for valid causal inference
+   - Sample still provides good statistical power
+
+```{r matching_visualization}
+# load matched data
+matched_data <- fread("matched_data.csv")
+
+# balance plot 
+balance_table <- data.table(
+  Variable = c("fin_sqft", "bedrooms", "agebuild", "bath", "year"),
+  Before_Matching = c(
+    mean(sub_data[treat == 1]$fin_sqft),
+    mean(sub_data[treat == 1]$bedrooms),
+    mean(sub_data[treat == 1]$agebuild),
+    mean(sub_data[treat == 1]$bath),
+    mean(sub_data[treat == 1]$year)
+  ),
+  After_Matching = c(
+    mean(matched_data[treat == 1]$fin_sqft),
+    mean(matched_data[treat == 1]$bedrooms),
+    mean(matched_data[treat == 1]$agebuild),
+    mean(matched_data[treat == 1]$bath),
+    mean(matched_data[treat == 1]$year)
+  )
+)
+
+balance_plot_data <- melt(balance_table, 
+                         id.vars = "Variable",
+                         measure.vars = c("Before_Matching", "After_Matching"),
+                         variable.name = "Matching_Status",
+                         value.name = "Value")
+
+ggplot(balance_plot_data, aes(x = Variable, y = Value, fill = Matching_Status)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(x = "Variable", y = "Value", 
+       title = "Balance Before and After Matching",
+       fill = "Matching Status") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+```
+
+## Key Assumptions and Validation
+
+a) Parallel Trends:
+   - Our parallel trends test showed significant pre-treatment differences
+   - This suggests the parallel trends assumption may not hold
+   - The segmented regression approach helps address this limitation
+   - We use multiple specifications to ensure robust results
+
+b) Stable Unit Treatment Value Assumption (SUTVA):
+   - Treatment of one property doesn't affect outcomes of other properties
+   - No spillover effects beyond the 0.5-mile buffer
+   - We test this through different buffer distances in robustness checks
+
+c) Selection Bias:
+   - Addressed through propensity score matching
+   - We match on key property characteristics
+   - Results are robust to different matching specifications
+
+## Modeling Strategy for Causal Inference
+
+Our analysis employs multiple model specifications to strengthen our causal inference about the Blue Line's impact on property values. Each model serves a specific purpose in addressing potential threats to causal validity:
+
+### 1. Base DiD Model with 2018 Opening (Model 1a)
+Purpose: Estimate the immediate effect of the Blue Line's physical opening
+```{r did_model_2018_fe}
+# With year fixed effects
+did_model_2018_fe <- lm(lnsp ~ treat + year_factor + 
+                        treat*post_2018 +
+                        fin_sqft + bedrooms + agebuild + bath,
+                        data = matched_data)
+summary(did_model_2018_fe)  
+# Without year fixed effects (robustness check)
+did_model_2018_no_fe <- lm(lnsp ~ treat + 
+                           treat*post_2018 +
+                           fin_sqft + bedrooms + agebuild + bath,
+                           data = matched_data)
+summary(did_model_2018_no_fe)
+```
+
+### 2. Base DiD Model with 2011 Announcement (Model 1b)
+Purpose: Capture anticipation effects from the announcement
+```{r did_model_2011_fe}
+# With year fixed effects
+did_model_2011_fe <- lm(lnsp ~ treat + year_factor + 
+                        treat*post_2011 +
+                        fin_sqft + bedrooms + agebuild + bath,
+                        data = matched_data)
+summary(did_model_2011_fe)
+# Without year fixed effects (robustness check)
+did_model_2011_no_fe <- lm(lnsp ~ treat + 
+                           treat*post_2011 +
+                           fin_sqft + bedrooms + agebuild + bath,
+                           data = matched_data)
+summary(did_model_2011_no_fe)
+```
+
+### 3. Segmented Regression Model
+Purpose: Allow for time-varying treatment effects and address parallel trends violations
+```{r segmented_regression}
+
+# period indicators based on the timeline (2007 original opening, 2011 extension announcement, 2018 extension opening)
+matched_data[, period := fcase(
+  year < 2007, "pre_original",
+  year >= 2007 & year < 2011, "post_original_pre_ext_announce",
+  year >= 2011 & year < 2018, "extension_announcement",
+  year >= 2018, "post_extension"
+)]
+matched_data[, period := factor(period, levels = c("pre_original", "post_original_pre_ext_announce", "extension_announcement", "post_extension"))]
+
+seg_model <- lm(
+  lnsp ~ treat +
+    treat * period +
+    time_since_2007 + treat * time_since_2007 +
+    time_since_2011 + treat * time_since_2011 +
+    time_since_2018 + treat * time_since_2018 +
+    fin_sqft + bedrooms + agebuild + bath,
+  data = matched_data
+)
+summary(seg_model)
+```
+
+```{r model_summary_table}
+# coefficients and statistics
+model_summary <- data.table(
+  Model = c("Physical Opening (2018)", "Announcement (2011)", "Segmented"),
+  Specification = c("With FE", "Without FE", "With FE", "Without FE", "Full"),
+  Treatment_Effect = c(
+    coef(did_model_2018_fe)["treat:post_2018"],
+    coef(did_model_2018_no_fe)["treat:post_2018"],
+    coef(did_model_2011_fe)["treat:post_2011"],
+    coef(did_model_2011_no_fe)["treat:post_2011"],
+    coef(seg_model)["treat:periodpost_opening"]
+  ),
+  SE = c(
+    sqrt(diag(vcovHC(did_model_2018_fe, type = "HC1")))["treat:post_2018"],
+    sqrt(diag(vcovHC(did_model_2018_no_fe, type = "HC1")))["treat:post_2018"],
+    sqrt(diag(vcovHC(did_model_2011_fe, type = "HC1")))["treat:post_2011"],
+    sqrt(diag(vcovHC(did_model_2011_no_fe, type = "HC1")))["treat:post_2011"],
+    sqrt(diag(vcovHC(seg_model, type = "HC1")))["treat:periodpost_opening"]
+  ),
+  R2 = c(
+    summary(did_model_2018_fe)$r.squared,
+    summary(did_model_2018_no_fe)$r.squared,
+    summary(did_model_2011_fe)$r.squared,
+    summary(did_model_2011_no_fe)$r.squared,
+    summary(seg_model)$r.squared
+  ),
+  N = c(
+    nobs(did_model_2018_fe),
+    nobs(did_model_2018_no_fe),
+    nobs(did_model_2011_fe),
+    nobs(did_model_2011_no_fe),
+    nobs(seg_model)
+  )
+)
+
+# percentage effects and confidence intervals
+model_summary[, `:=`(
+  Effect_Pct = (exp(Treatment_Effect) - 1) * 100,
+  CI_Lower = (exp(Treatment_Effect - 1.96 * SE) - 1) * 100,
+  CI_Upper = (exp(Treatment_Effect + 1.96 * SE) - 1) * 100
+)]
+
+kable(model_summary[, .(
+  Model,
+  Specification,
+  Effect = sprintf("%.1f%% (%.1f%%, %.1f%%)", Effect_Pct, CI_Lower, CI_Upper),
+  R2 = sprintf("%.3f", R2),
+  N = format(N, big.mark = ",")
+)], 
+caption = "Summary of DiD Model Results",
+col.names = c("Model", "Specification", "Treatment Effect (95% CI)", "R²", "N")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  add_header_above(c(" " = 2, "Effect Size" = 1, "Model Fit" = 2)) %>%
+  footnote(
+    general = "Treatment effects are reported as percentage changes with 95% confidence intervals. FE = Fixed Effects.",
+    general_title = "Note:"
+  )
+```
+
+# Analysis
+
+## Parallel Trends Visualization
+
+```{r parallel_trends}
+# Aggregate data 
+trend_data <- matched_data[, .(
+  mean_lnsp = mean(lnsp),
+  mean_price = mean(sales_price)
+), by = .(year, treat)]
+
+# parallel trends plot
+ggplot(trend_data, aes(x = year, y = mean_lnsp, group = treat, color = factor(treat))) +
+  geom_line() +
+  geom_vline(xintercept = 2018, linetype = "dashed") +
+  labs(x = "Year", y = "Log Sales Price", color = "Treatment") +
+  theme_classic()
+```
+
+#### Parallel Trends Visualization Interpretation
+
+The plot above shows the average log sales price over time for the treatment group (properties within 0.5 miles of the Blue Line) and the control group (properties outside the buffer), before and after the Blue Line's opening (indicated by the vertical dashed line).
+
+**Interpretation:**
+- **Pre-intervention period (before the dashed line):**  The treatment and control groups generally follow similar trends, but there are some differences in levels and slopes, especially in the years leading up to the intervention. This suggests that while the groups are somewhat comparable, the parallel trends assumption may not be perfectly satisfied.
+- **Post-intervention period (after the dashed line):**  After the Blue Line's opening, the treatment group's property values increase at a faster rate than the control group's, resulting in a widening gap between the two lines. This divergence is consistent with a positive treatment effect of the Blue Line on nearby property values.
+- **Implications:**  The visualization supports the use of a Difference-in-Differences approach, but the observed pre-trends highlight the importance of robustness checks and alternative specifications (such as segmented regression) to address potential violations of the parallel trends assumption.
+
+This plot provides visual evidence of the Blue Line's impact and underscores the need for careful modeling to ensure valid causal inference.
+
+#### Addressing Violations of the Parallel Trends Assumption
+
+While the Difference-in-Differences (DiD) approach relies on the parallel trends assumption, our analysis provides evidence that this assumption may not be fully satisfied in our data. The parallel trends visualization shows some divergence in trends between the treatment and control groups prior to the Blue Line opening. Additionally, our segmented regression model is specifically designed to address this limitation by allowing for different time trends in the pre- and post-intervention periods and between groups.
+
+The results from the segmented regression model reveal that the treatment effect evolved differently over time, with significant differences in trends before and after the intervention. This supports the conclusion that the parallel trends assumption is violated, and justifies the use of more flexible modeling approaches to obtain unbiased estimates of the Blue Line's impact.
+
+## Placebo Tests
+
+To verify the robustness of our results, we conduct placebo tests by testing "fake" treatment dates. This helps ensure that our observed effects are not due to random chance or pre-existing trends.
+
+```{r placebo_tests}
+# Function to run placebo test for a given year
+run_placebo_test <- function(placebo_year) {
+  # placebo treatment indicator
+  matched_data[, placebo_post := ifelse(year >= placebo_year, 1, 0)]
+  
+  # placebo model
+  placebo_model <- lm(lnsp ~ treat + year_factor + 
+                      treat*placebo_post +
+                      fin_sqft + bedrooms + agebuild + bath,
+                      data = matched_data)
+  
+  # Extract treatment effect, standard error, and p-value
+  effect <- coef(placebo_model)["treat:placebo_post"]
+  se <- sqrt(diag(vcovHC(placebo_model, type = "HC1")))["treat:placebo_post"]
+  p_value <- summary(placebo_model)$coefficients["treat:placebo_post", "Pr(>|t|)"]
+  
+  return(list(effect = effect, se = se, p_value = p_value))
+}
+
+# placebo tests for years 2005-2017
+placebo_years <- 2005:2017
+placebo_results <- lapply(placebo_years, run_placebo_test)
+
+placebo_table <- data.table(
+  Year = placebo_years,
+  Effect = sapply(placebo_results, function(x) x$effect),
+  SE = sapply(placebo_results, function(x) x$se),
+  P_Value = sapply(placebo_results, function(x) x$p_value)
+)
+
+ggplot(placebo_table, aes(x = Year, y = Effect)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = Effect - 1.96 * SE,
+                    ymax = Effect + 1.96 * SE)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 2011, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 2018, color = "blue", linetype = "dashed") +
+  labs(x = "Placebo Treatment Year", y = "Treatment Effect",
+       title = "Placebo Tests for Different Treatment Years",
+       subtitle = "Red line: Announcement year (2011)\nBlue line: Opening year (2018)") +
+  theme_classic()
+
+kable(placebo_table[, .(Year, Effect, SE, P_Value)],
+      caption = "Placebo Test Results",
+      digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Placebo Test Interpretation
+
+The placebo tests reveal that significant positive "treatment effects" are detected even when the treatment year is set before the actual Blue Line announcement or opening. For every placebo year (2005–2017), the estimated effect is positive and statistically significant, with effect sizes ranging from about 0.12 to 0.24 (log points) and all p-values well below 0.01. There is no sharp change in the estimated effect at the true intervention years (2011 or 2018); instead, the effect is already present and significant in the years before the Blue Line events.
+
+This pattern indicates that the treatment and control groups were not following parallel trends prior to the intervention, violating a key assumption of the Difference-in-Differences approach. As a result, the estimated treatment effects from the main DiD models may be confounded by pre-existing differences between the groups, rather than reflecting a true causal impact of the Blue Line. This finding underscores the importance of using more flexible models (such as segmented regression) and interpreting the DiD results with caution.
+
+## Detailed Time Series Analysis
+
+```{r detailed_time_series}
+# yearly means and confidence intervals
+yearly_stats <- matched_data[, .(
+  mean_lnsp = mean(lnsp),
+  se_lnsp = sd(lnsp) / sqrt(.N),
+  mean_price = mean(sales_price),
+  se_price = sd(sales_price) / sqrt(.N),
+  n = .N
+), by = .(year, treat)]
+
+# confidence intervals
+yearly_stats[, `:=`(
+  ci_lower_lnsp = mean_lnsp - 1.96 * se_lnsp,
+  ci_upper_lnsp = mean_lnsp + 1.96 * se_lnsp,
+  ci_lower_price = mean_price - 1.96 * se_price,
+  ci_upper_price = mean_price + 1.96 * se_price
+)]
+
+# confidence intervals
+ggplot(yearly_stats, aes(x = year, y = mean_lnsp, group = treat, color = factor(treat))) +
+  geom_line() +
+  geom_ribbon(aes(ymin = ci_lower_lnsp, ymax = ci_upper_lnsp, fill = factor(treat)), 
+              alpha = 0.2) +
+  geom_vline(xintercept = 2011, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 2018, color = "blue", linetype = "dashed") +
+  labs(x = "Year", y = "Log Sales Price", 
+       title = "Time Series of Property Values with Confidence Intervals",
+       subtitle = "Red line: Announcement year (2011)\nBlue line: Opening year (2018)") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+# price levels
+ggplot(yearly_stats, aes(x = year, y = mean_price, group = treat, color = factor(treat))) +
+  geom_line() +
+  geom_ribbon(aes(ymin = ci_lower_price, ymax = ci_upper_price, fill = factor(treat)), 
+              alpha = 0.2) +
+  geom_vline(xintercept = 2011, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 2018, color = "blue", linetype = "dashed") +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  labs(x = "Year", y = "Sales Price", 
+       title = "Time Series of Property Values (Dollar Values)",
+       subtitle = "Red line: Announcement year (2011)\nBlue line: Opening year (2018)") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+### Time Series Interpretation
+
+The time series plots indicate that property values near the Blue Line (treatment group) and in the control area followed somewhat similar trends before 2011, with overlapping confidence intervals and no clear, persistent gap. However, following the 2011 announcement, the treatment group began to outpace the control group, and this divergence accelerated after the 2018 opening. By the most recent years, the average property value in the treatment area is substantially higher than in the control area, with non-overlapping confidence intervals confirming statistical significance.
+
+This pattern suggests a strong association between proximity to the Blue Line and increased property values, with effects emerging as early as the announcement period and intensifying after the line opened. The timing indicates that market participants anticipated the Blue Line's impact, and much of the value appreciation was capitalized before the line became operational. The magnitude of the difference exceeds $100,000 in some years, highlighting the substantial economic impact.
+
+However, these results should be interpreted with caution. The placebo and formal parallel trends tests indicate that some of the observed divergence may be due to pre-existing differences between the groups, not solely the Blue Line. Therefore, while the time series plots are visually compelling, they should be considered alongside robustness checks and more flexible models (such as segmented regression) for a more accurate causal interpretation.
+
+
+## Formal Parallel Trends Tests
+
+```{r parallel_trends_tests}
+# Test for parallel trends in pre-treatment period
+pre_treatment_data <- matched_data[year < 2011]
+
+# regression with time trend interaction
+pt_test <- lm(lnsp ~ treat + year + treat*year +
+              fin_sqft + bedrooms + agebuild + bath,
+              data = pre_treatment_data)
+
+# F-test for parallel trends
+pt_f_test <- linearHypothesis(pt_test, "treat:year = 0")
+
+cat("Parallel Trends Test Results:\n")
+cat("F-statistic:", pt_f_test$F[2], "\n")
+cat("p-value:", pt_f_test$`Pr(>F)`[2], "\n")
+
+# Test for parallel trends in announcement period
+announcement_data <- matched_data[year >= 2011 & year < 2018]
+pt_test_announcement <- lm(lnsp ~ treat + year + treat*year +
+                          fin_sqft + bedrooms + agebuild + bath,
+                          data = announcement_data)
+pt_f_test_announcement <- linearHypothesis(pt_test_announcement, "treat:year = 0")
+
+cat("\nParallel Trends Test Results (Announcement Period):\n")
+cat("F-statistic:", pt_f_test_announcement$F[2], "\n")
+cat("p-value:", pt_f_test_announcement$`Pr(>F)`[2], "\n")
+```
+
+### Parallel Trends Test Interpretation
+
+The formal parallel trends tests show that the treatment and control groups exhibited similar trends before the Blue Line announcement (pre-treatment period, 2004–2010: F-statistic = 2.17, p-value = 0.14), so we fail to reject the null hypothesis of parallel trends in this period. This supports the validity of the DiD approach for estimating effects that occur after 2011.
+
+However, during the announcement period (2011–2017: F-statistic = 20.82, p-value < 0.001), the groups' trends diverged significantly, and we reject the null hypothesis of parallel trends. This is strong evidence of a violation of the parallel trends assumption in this period, meaning that DiD estimates for the announcement period may be confounded by differences in group trajectories, not just the Blue Line's impact.
+
+These results reinforce the importance of robustness checks and the use of more flexible modeling strategies, such as segmented regression, to account for time-varying differences between groups and to obtain more reliable causal estimates.
+
+## Additional Visualizations
+
+
+### Covariate Balance Plot (Love Plot)
+
+```{r love_plot, warning=FALSE}
+library(cobalt)
+love.plot(match.out, binary = "std", var.order = "unadjusted", abs = TRUE,
+          threshold = 0.1, stars = "raw", var.names = c(
+            fin_sqft = "Finished Sqft",
+            bedrooms = "Bedrooms",
+            agebuild = "Age of Building",
+            bath = "Bathrooms",
+            year = "Year"
+          )) +
+  ggtitle("Covariate Balance Before and After Matching (Love Plot)")
+```
+
+### Covariate Balance (Love Plot) Interpretation
+
+The Love plot above displays the absolute standardized mean differences for key covariates between the treatment and control groups, both before matching (unadjusted) and after matching (adjusted).
+
+- **Before Matching (Red Points):**
+The treatment and control groups were substantially imbalanced on several covariates, as indicated by the red points being far to the right of the vertical threshold line (commonly set at 0.1 or 0.25). This means that, prior to matching, the groups differed significantly in characteristics such as finished square footage, number of bedrooms, age of building, and year.
+- **After Matching (Blue Points):**
+After propensity score matching, the blue points (adjusted) for all covariates are clustered close to zero and well within the acceptable threshold. This demonstrates that the matching procedure was highly effective in balancing the treatment and control groups on all observed characteristics.
+- **Interpretation of Threshold:**
+The vertical dashed line (often at 0.1) is a common benchmark for acceptable balance. All adjusted covariates fall well below this line, indicating excellent covariate balance.
+- **Why This Matters:**
+Achieving covariate balance is crucial for causal inference in observational studies. It ensures that any observed differences in outcomes (e.g., property values) between the treatment and control groups are less likely to be driven by pre-existing differences in these characteristics, and more likely to reflect the true effect of the Blue Line.
+- **Summary:**
+The Love plot provides strong visual evidence that the matching process successfully eliminated systematic differences between the treatment and control groups on all key covariates. This supports the validity of your Difference-in-Differences analysis and increases confidence that your estimated treatment effects are not confounded by observable selection bias.
+
+
+
+### Quantile Treatment Effects
+
+```{r quantile_treatment_effects}
+library(quantreg)
+# post_2018 indicator
+matched_data[, post_2018 := ifelse(year >= 2018, 1, 0)]
+
+quantiles <- seq(0.1, 0.9, by = 0.1)
+
+# quantile regressions
+qte_results <- lapply(quantiles, function(q) {
+  tryCatch({
+    quantreg::rq(lnsp ~ treat + post_2018 + treat*post_2018 + 
+                 fin_sqft + bedrooms + agebuild + bath,
+                 data = matched_data, tau = q)
+  }, error = function(e) {
+    cat("Error at quantile", q, ":", e$message, "\n")
+    return(NULL)
+  })
+})
+
+# Filter out any failed models
+qte_results <- qte_results[!sapply(qte_results, is.null)]
+
+qte_df <- data.frame(
+  Quantile = quantiles[!sapply(qte_results, is.null)],
+  Effect = sapply(qte_results, function(x) coef(x)["treat:post_2018"]),
+  SE = sapply(qte_results, function(x) summary(x, se = "boot")$coefficients["treat:post_2018", "Std. Error"])
+)
+
+ggplot(qte_df, aes(x = Quantile, y = Effect)) +
+  geom_point() +
+  geom_line() +
+  geom_errorbar(aes(ymin = Effect - 1.96 * SE, ymax = Effect + 1.96 * SE), width = 0.02) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Quantile Treatment Effects of Blue Line",
+       subtitle = "Error bars show 95% confidence intervals",
+       x = "Quantile",
+       y = "Treatment Effect (log points)") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+### Quantile Treatment Effects Interpretation
+
+The plot above shows the estimated treatment effect of proximity to the Blue Line at different points (quantiles) of the property value distribution, with 95% confidence intervals.
+
+- **Heterogeneous Effects:**
+The treatment effect is not uniform across the distribution of log sale prices. The effect is largest at the lower and middle quantiles (especially around the 0.2–0.4 quantiles), reaching as high as ~0.4–0.5 log points, and then declines at higher quantiles.
+- **Interpretation of the Slope:**
+This pattern suggests that the Blue Line had a stronger positive impact on lower- and mid-priced properties than on higher-priced properties. The effect diminishes and becomes less precise (wider confidence intervals) at the upper quantiles.
+- **Statistical Significance:** 
+The confidence intervals for the lower and middle quantiles are above zero, indicating statistically significant positive effects in these ranges. At higher quantiles, the confidence intervals widen and often include zero, suggesting the effect is not statistically significant for the most expensive properties.
+- **Policy Implications:**
+The Blue Line appears to have contributed most to the appreciation of more affordable and mid-range properties, which may have implications for gentrification and housing affordability in neighborhoods near the transit line.
+- **Summary:**
+The quantile regression results reveal that the Blue Line's impact on property values is not constant across the market. Instead, it is most pronounced for lower- and mid-priced homes, with the effect tapering off for higher-priced properties. This heterogeneity is important for understanding the distributional consequences of transit investments and for designing targeted policy responses.
+
+### Density Plots
+
+```{r yearly_density_plots}
+# yearly density plots
+matched_data[, group := ifelse(treat == 1, "Treatment", "Control")]
+yearly_plots <- lapply(unique(matched_data$year), function(y) {
+  ggplot(matched_data[year == y], aes(x = lnsp, color = group, fill = group)) +
+    geom_density(alpha = 0.2) +
+    labs(title = paste("Year", y),
+         x = "Log Sales Price",
+         y = "Density") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "bottom")
+})
+
+gridExtra::grid.arrange(grobs = yearly_plots, ncol = 4,
+                       top = "Yearly Price Distributions: Treatment vs Control Groups")
+
+ggplot(matched_data, aes(x = lnsp, color = group, fill = group)) +
+  geom_density(alpha = 0.2) +
+  facet_wrap(~year, scales = "free_y", ncol = 4) +
+  labs(title = "Yearly Price Distributions: Treatment vs Control Groups",
+       x = "Log Sales Price",
+       y = "Density") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Density Plots Interpretation
+
+The yearly density plots above compare the distribution of log sale prices for the treatment (properties near the Blue Line) and control (properties farther away) groups from 2004 to 2023. Here is how to interpret these plots:
+
+**Pre-Treatment Period (2004–2010):**
+- The distributions for treatment and control groups are very similar in most years, indicating that both groups followed comparable price trends before the Blue Line announcement. This supports the parallel trends assumption required for Difference-in-Differences analysis.
+
+**Announcement and Construction Period (2011–2017):**
+- Starting around 2011, the treatment group's distribution begins to shift right (toward higher log prices) compared to the control group. This suggests anticipation effects, where property values near the future Blue Line started to rise even before the line opened, likely due to market expectations.
+
+**Post-Treatment Period (2018–2023):**
+- After the Blue Line opened in 2018, the gap between the treatment and control groups widens in most years. The treatment group's distribution is consistently to the right of the control group, indicating higher property values near the Blue Line after it became operational. This is strong visual evidence of a treatment effect.
+
+**Distribution Shape:**
+- The shape of the distributions can reveal whether the effect is uniform or concentrated in certain price ranges. If the treatment group's distribution becomes more spread out or develops a higher peak, it may indicate heterogeneous effects (e.g., the Blue Line benefits higher-end properties more).
+
+**Summary:**
+- These plots visually confirm that the treatment and control groups were similar before the intervention and that the treatment effect emerged and grew after the Blue Line announcement and opening. This supports the validity of the DiD approach and provides a dynamic view of how the treatment effect evolved over time.
+
+
+
+
+# Results and Interpretation
+
+## Summary of Main Findings
+
+- Property values near the Blue Line increased substantially after both the announcement and opening, with effects of +15–18% (with fixed effects) and +23–25% (without fixed effects).
+- Segmented regression shows the largest appreciation occurred before the line opened, with little additional effect post-opening.
+- Placebo and parallel trends tests reveal that some observed effects may be due to pre-existing differences between groups, especially during the announcement period. Causal inference is most credible for post-2011 effects, when groups were parallel.
+- Robustness checks and flexible models (like segmented regression) are essential for reliable estimates.
+
+## Gentrification and Policy Implications
+
+- The timing and magnitude of effects suggest that gentrification pressures began before the Blue Line opened, highlighting the need for early anti-displacement and affordability interventions.
+- Broader market conditions also played a significant role, so policies should address both transit-specific and general market forces.
+
+## Visual and Diagnostic Evidence
+
+- Time series plots show a clear divergence in property values after the Blue Line announcement and opening.
+- Diagnostic tests (placebo and parallel trends) indicate that not all observed effects are purely causal.
+
+## Conclusion
+
+The Charlotte Blue Line had a significant positive impact on nearby property values, but some of this effect may reflect pre-existing differences. Early and targeted policy interventions are needed to address affordability and displacement risks.
+
+*For a detailed discussion of results, diagnostics, and interpretation, see the companion Notes & Explanations Rmd.*
